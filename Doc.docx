@@ -1,0 +1,242 @@
+SAP S/4HANA 2022 · Custom Development
+Z-Status Framework
+MVP Implementation Guide · v1.0
+
+Property
+Value
+Scope
+Pure ABAP API. No CDS, no RAP, no Fiori.
+Objects
+14 (3 domains, 4 data elements, 4 tables, 1 exception, 1 interface, 1 class)
+Platform
+SAP S/4HANA 2022 · ABAP
+Full design reference
+ZStatusFramework_TechnicalDesign_v11.docx
+abapgit package
+ZStatusFramework_MVP_abapgit.zip
+Date
+19 May 2026
+
+
+1. MVP Scope
+The MVP delivers a functional status engine as a pure ABAP API. A consuming application can call change_status on day one and receive a fully guarded, concurrency-safe, append-only log entry. There is no Fiori configuration app, no CDS layer, and no RAP behavior in this phase. Configuration is loaded directly into the four tables via SE16N or a test program.
+What is in scope
+Category
+Objects (14 total)
+Purpose
+Domains (3)
+ZCASTAT_D_TYPEID / _CODE / _BOKEY
+CHAR(40), CHAR(20), CHAR(90) type definitions
+Data elements (4)
+ZCASTAT_E_TYPEID / _CODE / _TYPEDESC / _BOKEY
+Field labels and search help references
+Tables (4)
+ZCASTAT_TYPE / CODE / ACTION / LOG
+State machine definition + append-only audit log
+Exception class (1)
+ZCX_CA_STATUS_ERROR
+Typed exceptions for all failure modes
+BAdI interface (1)
+ZIFI_CA_STAT_TRANSITION
+Extension point — validate_transition + after_transition
+Manager class (1)
+ZCL_CA_STATUSMANAGER
+change_status, get_current_status, get_log, get_available_actions, is_transition_allowed
+
+
+What is deferred to Phase 2
+Deferred object
+Reason
+ZCASTAT_LANE / FLWNODE / FLWCONN
+ProcessFlow visual config — no runtime dependency on core transition logic
+Draft tables (_D)
+No draft-enabled config Fiori app in MVP
+ZI_CA_* CDS views (6)
+No Fiori app requires them in MVP
+ZBD_CA_* behavior definitions (2)
+No RAP BO in MVP
+ZBP_CA_STATUSTYPE (deletion guards)
+Requires behavior definitions — added in Phase 2 with the config Fiori app
+
+
+2. Table Design
+Four tables are sufficient to drive the full state machine at runtime. The three config tables (Delivery Class C) are loaded manually in the MVP. ZCASTAT_LOG (Delivery Class A) is written exclusively by ZCL_CA_STATUSMANAGER.
+2.1 ZCASTAT_TYPE
+Field
+Type
+Key
+Notes
+status_type_id
+CHAR(40)
+PK
+Start with Z or Y
+status_type_description
+CHAR(100)
+
+
+Display label
+business_object_type
+CHAR(30)
+
+
+DDIC table or CDS entity name (informational in MVP)
+is_active
+XFELD
+
+
+Must be X for runtime use
+created_by_user / created_at
+SYUNAME / UTCLONG
+
+
+Audit fields — stamped manually in MVP
+changed_by_user / changed_at
+SYUNAME / UTCLONG
+
+
+ETag in Phase 2 RAP BO
+
+
+ZCASTAT_CODE has the same key pattern (STATUS_TYPE_ID + STATUS_CODE) plus STATUS_LABEL, CRITICALITY (INT1), IS_INITIAL, IS_FINAL, IS_ACTIVE, and audit fields. ZCASTAT_ACTION key is STATUS_TYPE_ID + FROM_STATUS_CODE + TO_STATUS_CODE + ACTION_CODE, plus ACTION_NAME, REQUIRES_COMMENT, AUTHORIZATION_OBJECT, IS_ACTIVE, and audit fields. See the full design document (v11) for complete field definitions.
+2.2 ZCASTAT_LOG (append-only)
+Field
+Type
+Notes
+log_uuid
+SYSUUID_16
+PK — collision-free, no serialization needed
+log_sequence
+INT8
+Human-readable reference + sort key. Best-effort from ZCASTAT_NR. Value 0 if unavailable.
+status_type_id
+CHAR(40)
+FK → ZCASTAT_TYPE
+business_obj_key
+CHAR(90)
+Concatenated key of the business object instance
+from_status_code / to_status_code
+CHAR(20)
+from_status_code empty on initial CREATE transition
+action_code / remark
+CHAR(20) / CHAR(255)
+Action that triggered the transition + optional user remark
+changed_at / changed_date / changed_time
+UTCLONG / DATS / TIMS
+Three-field timestamp strategy: UTC precision + SE16N-readable local date/time
+
+
+3. Manager Class API
+ZCL_CA_STATUSMANAGER is the only write path to ZCASTAT_LOG. All five public methods are stateless — instantiate once per call or hold one instance per request context.
+Method
+Description
+change_status
+Acquires enqueue lock, resolves current and target status, validates config, calls BAdI VALIDATE_TRANSITION, writes log entry, calls BAdI AFTER_TRANSITION, releases lock. iv_from_status_code and iv_to_status_code are both optional — auto-resolved when unambiguous. Raises ZCX_CA_STATUS_ERROR on any failure.
+get_current_status
+Returns the to_status_code of the most recent log entry for a business object instance. Uses ORDER BY log_sequence DESC, changed_at DESC. Returns initial value if no log entries exist.
+get_log
+Returns all ZCASTAT_LOG entries for a business object instance, ordered chronologically ascending by log_sequence, changed_at. Used by the consuming app to render a status timeline.
+get_available_actions
+Returns all active ZCASTAT_ACTION rows for a given from_status_code and status_type_id. Use this to build action buttons in the consuming app UI without coupling to the table name.
+is_transition_allowed
+Dry-run validation without acquiring the lock or writing any entry. Returns ABAP_TRUE if the action is currently valid. Use for UI enablement checks (button visible/enabled logic).
+
+
+3.1 change_status internal sequence
+#
+Step
+Key detail
+①
+ENQUEUE_EZCASTAT_LOCK
+Mode E, _scope=2, _wait=false. Raises CONCURRENT_LOCK on foreign_lock.
+②
+Resolve current status
+Safe after lock. Auto from log if iv_from_status_code not supplied.
+③
+Resolve target status
+Auto when exactly one active action matches. Raises AMBIGUOUS_ACTION if two or more qualify.
+④
+Validate configuration
+Active row must exist in ZCASTAT_ACTION for from+to+type. Raises INVALID_TRANSITION.
+⑤
+BAdI VALIDATE_TRANSITION
+Blocking. Filter on status_type_id. No-op if no implementation active.
+⑥
+Write log entry
+SYSUUID_16 PK + best-effort log_sequence from ZCASTAT_NR + three-field timestamp.
+⑦
+BAdI AFTER_TRANSITION
+Non-blocking. Exceptions caught and logged. Transition already committed. Receives iv_log_uuid.
+⑧
+DEQUEUE_EZCASTAT_LOCK
+Explicit release. Also auto-released on COMMIT/ROLLBACK via _scope=2.
+
+
+4. Activation Sequence
+Step
+Action
+Detail
+1
+abapgit pull
+Pull ZStatusFramework_MVP_abapgit.zip into development system
+2
+Domains + data elements (SE11)
+Activate all 7 via mass activation
+3
+Tables (SE11)
+Activate: ZCASTAT_TYPE → ZCASTAT_CODE → ZCASTAT_ACTION → ZCASTAT_LOG. Verify delivery class C/A.
+4
+Lock object (SE11)
+Create EZCASTAT_LOCK. Table: ZCASTAT_LOG. Mode E. Fields: STATUS_TYPE_ID + BUSINESS_OBJ_KEY.
+5
+Number range (SNRO)
+Create ZCASTAT_NR. Interval 01, 0000000001–9999999999. Buffered, size 10.
+6
+BAdI (SE19)
+Create ESPOT_ZCASTAT + BADI_ZCASTAT_TRANSITION. Filter STATUS_TYPE_ID typed with ZCASTAT_E_TYPEID (CHAR 40). Multiple-use: Yes.
+7
+Message class (SE91)
+Create ZCASTAT_MSG with 6 exception texts (see README).
+8
+ABAP objects (ADT / SE24)
+Activate in order: ZCX_CA_STATUS_ERROR → ZIFI_CA_STAT_TRANSITION → ZCL_CA_STATUSMANAGER
+9
+Seed data (SE16N)
+Insert one row in ZCASTAT_TYPE, status codes in ZCASTAT_CODE, transitions in ZCASTAT_ACTION.
+
+
+5. Usage Example
+DATA lo_mgr TYPE REF TO zcl_ca_statusmanager.
+lo_mgr = NEW #( ).
+
+" --- Execute a transition ---
+TRY.
+  lo_mgr->change_status(
+    iv_status_type_id   = 'ZMM_PO_REQUEST'
+    iv_business_obj_key = ls_po-ebeln
+    iv_action_code      = 'APPROVE'
+    iv_remark           = 'Verified and approved' ).
+  COMMIT WORK AND WAIT.
+CATCH zcx_ca_status_error INTO DATA(lx).
+  ROLLBACK WORK.
+  MESSAGE lx->get_text( ) TYPE 'E'.
+ENDTRY.
+
+" --- Read current status ---
+DATA(lv_status) = lo_mgr->get_current_status(
+  iv_status_type_id   = 'ZMM_PO_REQUEST'
+  iv_business_obj_key = ls_po-ebeln ).
+
+" --- Build action buttons for current state ---
+DATA(lt_actions) = lo_mgr->get_available_actions(
+  iv_status_type_id   = 'ZMM_PO_REQUEST'
+  iv_from_status_code = lv_status ).
+
+" --- Check before enabling a button ---
+IF lo_mgr->is_transition_allowed(
+     iv_status_type_id   = 'ZMM_PO_REQUEST'
+     iv_business_obj_key = ls_po-ebeln
+     iv_action_code      = 'APPROVE' ) = abap_true.
+  " enable Approve button
+ENDIF.
+6. Phase 2 Path
+Pull the full ZStatusFramework_abapgit repository to add the visual ProcessFlow layer, the draft-enabled RAP configuration Fiori app, and the deletion guards. The four MVP tables and ZCL_CA_STATUSMANAGER are identical between MVP and the full version — no migration or data conversion is required. The full repository adds objects on top of the MVP without modifying any existing object.
